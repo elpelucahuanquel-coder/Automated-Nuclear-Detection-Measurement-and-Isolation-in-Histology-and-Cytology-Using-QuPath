@@ -1,0 +1,712 @@
+ /*
+  * =====================================================================
+  *  Aislar_Nucleos_QuPath.groovy  —  v2 (QuPath 0.7)
+  *  Detecta núcleos y exporta cada uno AISLADO como TIFF recortado
+  *  (fondo fuera del contorno eliminado/blanco), + máscara de etiquetas + CSV.
+  *
+  *  CONFIGURADO PARA HISTOLOGÍA:
+  *    Pixel Width  = 0.26 µm/px
+  *    Pixel Height = 0.26 µm/px
+  *
+  *  SALIDA:
+  *    Escritorio/prueba 1/nucleos_aislados/<imagen>/
+  *
+  * =====================================================================
+  */
+
+import qupath.lib.images.servers.LabeledImageServer
+import qupath.lib.regions.RegionRequest
+import qupath.imagej.tools.IJTools
+import qupath.lib.roi.RoiTools
+import qupath.lib.common.GeneralTools
+import qupath.lib.common.ColorTools
+import ij.IJ
+import java.awt.Color
+
+
+// =========================== PARÁMETROS ===========================
+
+def TIPO           = "CAMPO_CLARO"    // Histología: Pap / H&E / hematoxilina
+
+def CANAL_NUCLEAR  = "Blue"           // Solo FLUORESCENCIA
+
+// Calibración de las imágenes de histología
+def TAMANO_PIXEL_UM = 0.26            // µm/píxel
+
+
+def SIGMA          = 1.0              // suavizado (µm)
+def AREA_MIN       = 15               // área mínima (µm²)
+def AREA_MAX       = 200              // área máxima (µm²)
+def FONDO_RADIO    = 15               // radio de sustracción de fondo (µm)
+
+def UMBRAL         = 0.08             // campo claro: densidad óptica
+
+def CIRC_MIN       = 0.0              // circularidad mínima
+def EXCLUIR_BORDES = true
+def PADDING_PX     = 10
+
+// true = núcleo aislado con fondo blanco
+// false = recorte rectangular
+def ENMASCARAR     = true
+
+// ==================================================================
+
+
+def campoClaro = TIPO.toUpperCase().contains("CLARO")
+
+setImageType(
+        campoClaro
+        ? 'BRIGHTFIELD_H_E'
+        : 'FLUORESCENCE'
+)
+
+
+def imageData = getCurrentImageData()
+
+if (imageData == null) {
+    println "ERROR: No hay ninguna imagen abierta."
+    return
+}
+
+def server = imageData.getServer()
+
+
+// ---------- Calibración ----------
+//
+// Se fuerza SIEMPRE:
+//
+// Pixel Width  = 0.26 µm/px
+// Pixel Height = 0.26 µm/px
+//
+
+if (TAMANO_PIXEL_UM > 0) {
+
+    setPixelSizeMicrons(
+            TAMANO_PIXEL_UM,
+            TAMANO_PIXEL_UM
+    )
+
+    server = imageData.getServer()
+}
+
+
+def cal = server.getPixelCalibration()
+
+def calibrada = cal.hasPixelSizeMicrons()
+
+def unidad = calibrada ? "µm" : "px"
+
+
+println ""
+println "=============================================="
+println "CALIBRACIÓN"
+println "=============================================="
+
+println "Pixel Width  = ${cal.getPixelWidthMicrons()} µm/px"
+println "Pixel Height = ${cal.getPixelHeightMicrons()} µm/px"
+
+println "=============================================="
+println ""
+
+
+// ---------- Canal ----------
+
+def canales = server.getMetadata()
+        .getChannels()
+        .collect { it.getName() }
+
+
+if (!campoClaro && !canales.contains(CANAL_NUCLEAR)) {
+
+    println "ERROR: el canal '${CANAL_NUCLEAR}' no existe."
+
+    println "Canales disponibles: ${canales}"
+
+    return
+}
+
+
+// ---------- 1) Detección ----------
+//
+// Si dibujaste una o más anotaciones:
+// detecta solo dentro de ellas.
+//
+// Si no hay ninguna:
+// analiza la imagen completa.
+//
+
+removeObjects(
+        getDetectionObjects(),
+        true
+)
+
+
+if (getAnnotationObjects().isEmpty()) {
+
+    createFullImageAnnotation(true)
+
+    println "Sin anotaciones: se analiza la imagen completa."
+
+} else {
+
+    selectAnnotations()
+
+    println "Analizando dentro de ${getAnnotationObjects().size()} anotación(es) dibujada(s)."
+}
+
+
+// ---------- Parámetros del detector ----------
+
+def p = [:]
+
+
+if (campoClaro) {
+
+    p["detectionImageBrightfield"] = "Hematoxylin OD"
+    p["maxBackground"] = 2.0
+
+} else {
+
+    p["detectionImage"] = CANAL_NUCLEAR
+
+}
+
+
+// ---------- Parámetros calibrados ----------
+
+if (calibrada) {
+
+    p["requestedPixelSizeMicrons"] = 0.0
+
+    p["backgroundRadiusMicrons"] = FONDO_RADIO
+
+    p["medianRadiusMicrons"] = 0.0
+
+    p["sigmaMicrons"] = SIGMA
+
+    p["minAreaMicrons"] = AREA_MIN
+
+    p["maxAreaMicrons"] = AREA_MAX
+
+    p["cellExpansionMicrons"] = 0.0
+
+} else {
+
+    p["backgroundRadius"] = FONDO_RADIO
+
+    p["medianRadius"] = 0.0
+
+    p["sigma"] = SIGMA
+
+    p["minArea"] = AREA_MIN
+
+    p["maxArea"] = AREA_MAX
+
+    p["cellExpansion"] = 0.0
+
+}
+
+
+p["threshold"] = UMBRAL
+
+p["watershedPostProcess"] = true
+
+p["includeNuclei"] = true
+
+p["smoothBoundaries"] = true
+
+p["makeMeasurements"] = true
+
+
+def json = "{"
+
+json += p.collect { k, v ->
+
+    "\"${k}\": " +
+    (
+        v instanceof String
+        ? "\"${v}\""
+        : v
+    )
+
+}.join(", ")
+
+json += "}"
+
+
+// ---------- Ejecutar detector ----------
+
+runPlugin(
+        'qupath.imagej.detect.cells.WatershedCellDetection',
+        json
+)
+
+
+if (getDetectionObjects().isEmpty()) {
+
+    println ""
+    println "No se detectaron núcleos."
+
+    println "Ajusta UMBRAL:"
+    println "  Para campo claro prueba 0.05–0.25"
+
+    return
+}
+
+
+// ---------- 2) Filtros ----------
+
+def W = server.getWidth()
+def H = server.getHeight()
+
+def pw = calibrada
+        ? cal.getPixelWidthMicrons()
+        : 1.0
+
+def ph = calibrada
+        ? cal.getPixelHeightMicrons()
+        : 1.0
+
+
+def eliminar = getDetectionObjects().findAll { d ->
+
+    def r = d.getROI()
+
+    def tocaBorde =
+
+            r.getBoundsX() <= 1 ||
+            r.getBoundsY() <= 1 ||
+            r.getBoundsX() +
+                    r.getBoundsWidth()
+                    >= W - 1 ||
+            r.getBoundsY() +
+                    r.getBoundsHeight()
+                    >= H - 1
+
+
+    def area =
+            r.getScaledArea(
+                    pw,
+                    ph
+            )
+
+
+    def per =
+            r.getScaledLength(
+                    pw,
+                    ph
+            )
+
+
+    def circ =
+            per > 0
+            ? 4 * Math.PI * area /
+              (per * per)
+            : 0
+
+
+    (
+        (EXCLUIR_BORDES && tocaBorde)
+        ||
+        circ < CIRC_MIN
+    )
+}
+
+
+removeObjects(
+        eliminar,
+        true
+)
+
+
+def nucleos = getDetectionObjects().sort { a, b ->
+
+    (a.getROI().getCentroidY()
+            <=> b.getROI().getCentroidY())
+    ?:
+    (a.getROI().getCentroidX()
+            <=> b.getROI().getCentroidX())
+}
+
+
+nucleos.eachWithIndex { d, i ->
+
+    d.setName(
+            String.format(
+                    "nucleo_%03d",
+                    i + 1
+            )
+    )
+}
+
+
+fireHierarchyUpdate()
+
+
+println "Núcleos retenidos: ${nucleos.size()}"
+
+println "Eliminados por borde/circularidad: ${eliminar.size()}"
+
+
+
+// ---------- 3) Carpeta de salida ----------
+//
+// Escritorio/prueba 1/nucleos_aislados/<imagen>/
+//
+
+def entry = getProjectEntry()
+
+def nombreOriginal =
+        entry != null
+        ? entry.getImageName()
+        : server.getMetadata().getName()
+
+
+def nombre =
+        GeneralTools.stripInvalidFilenameChars(
+                GeneralTools.stripExtension(
+                        nombreOriginal
+                )
+        )
+
+
+def escritorio = new File(
+        System.getProperty("user.home"),
+        "Desktop"
+)
+
+
+def carpetaPrueba = new File(
+        escritorio,
+        "prueba 1"
+)
+
+
+def carpetaNucleos = new File(
+        carpetaPrueba,
+        "nucleos_aislados"
+)
+
+
+def outDir = new File(
+        carpetaNucleos,
+        nombre
+)
+
+
+outDir.mkdirs()
+
+
+println ""
+println "Directorio de salida:"
+println outDir.getAbsolutePath()
+println ""
+
+
+
+// ---------- 4) Máscara de etiquetas ----------
+
+def labelServer =
+
+        new LabeledImageServer.Builder(imageData)
+
+        .backgroundLabel(
+                0,
+                ColorTools.BLACK
+        )
+
+        .downsample(1.0)
+
+        .useDetections()
+
+        .useInstanceLabels()
+
+        .multichannelOutput(false)
+
+        .build()
+
+
+writeImage(
+        labelServer,
+        new File(
+                outDir,
+                nombre + "_mascara.tif"
+        ).getAbsolutePath()
+)
+
+
+
+// ---------- 5) Función: fondo blanco ----------
+//
+// Todo lo que queda FUERA del núcleo se pinta de blanco.
+//
+
+def pintarFondoBlanco = { imp, roiIJ ->
+
+    def stack = imp.getStack()
+
+    for (
+            int s = 1;
+            s <= stack.getSize();
+            s++
+    ) {
+
+        def ip =
+                stack.getProcessor(s)
+
+
+        if (
+                ip instanceof
+                ij.process.ColorProcessor
+        ) {
+
+            // RGB
+            ip.setColor(
+                    Color.WHITE
+            )
+
+        } else {
+
+            // Escala de grises
+            ip.setValue(
+                    ip.maxValue()
+            )
+        }
+
+
+        ip.fillOutside(
+                roiIJ
+        )
+    }
+}
+
+
+
+// ---------- 6) Imagen completa ----------
+
+def reqTodo =
+
+        RegionRequest.createInstance(
+                server.getPath(),
+                1.0,
+                0,
+                0,
+                W,
+                H
+        )
+
+
+def imgTodo =
+
+        IJTools.convertToImagePlus(
+                server,
+                reqTodo
+        )
+
+
+def impTodo =
+        imgTodo.getImage()
+
+
+def unionROIs =
+
+        RoiTools.union(
+                nucleos.collect {
+                    it.getROI()
+                }
+        )
+
+
+pintarFondoBlanco(
+        impTodo,
+        IJTools.convertToIJRoi(
+                unionROIs,
+                imgTodo
+        )
+)
+
+
+impTodo.setTitle(
+        nombre +
+        "_nucleos_fondo_blanco"
+)
+
+
+IJ.saveAsTiff(
+        impTodo,
+        new File(
+                outDir,
+                nombre +
+                "_nucleos_fondo_blanco.tif"
+        ).getAbsolutePath()
+)
+
+
+IJ.saveAs(
+        impTodo,
+        "PNG",
+        new File(
+                outDir,
+                nombre +
+                "_nucleos_fondo_blanco.png"
+        ).getAbsolutePath()
+)
+
+
+
+// ---------- 7) CADA NÚCLEO AISLADO ----------
+//
+// Cada núcleo se recorta siguiendo su contorno.
+// Todo lo que queda fuera del contorno se pinta de BLANCO.
+//
+// Se guarda exclusivamente en TIFF.
+//
+
+nucleos.each { d ->
+
+    def r = d.getROI()
+
+
+    def x0 = Math.max(
+            0,
+            (int)Math.floor(
+                    r.getBoundsX()
+            ) - PADDING_PX
+    )
+
+
+    def y0 = Math.max(
+            0,
+            (int)Math.floor(
+                    r.getBoundsY()
+            ) - PADDING_PX
+    )
+
+
+    def x1 = Math.min(
+            W,
+            (int)Math.ceil(
+                    r.getBoundsX() +
+                    r.getBoundsWidth()
+            ) + PADDING_PX
+    )
+
+
+    def y1 = Math.min(
+            H,
+            (int)Math.ceil(
+                    r.getBoundsY() +
+                    r.getBoundsHeight()
+            ) + PADDING_PX
+    )
+
+
+    def req =
+
+            RegionRequest.createInstance(
+                    server.getPath(),
+                    1.0,
+                    x0,
+                    y0,
+                    x1 - x0,
+                    y1 - y0,
+                    r.getZ(),
+                    r.getT()
+            )
+
+
+    def pathImage =
+
+            IJTools.convertToImagePlus(
+                    server,
+                    req
+            )
+
+
+    def imp =
+            pathImage.getImage()
+
+
+    if (ENMASCARAR) {
+
+        def roiIJ =
+
+                IJTools.convertToIJRoi(
+                        r,
+                        pathImage
+                )
+
+
+        // -------------------------------------------------------------
+        // Pinta de blanco TODO lo que está fuera del núcleo
+        // -------------------------------------------------------------
+
+        pintarFondoBlanco(
+                imp,
+                roiIJ
+        )
+
+
+        imp.setRoi(
+                roiIJ
+        )
+    }
+
+
+    imp.setTitle(
+            d.getName()
+    )
+
+
+    // -------------------------------------------------------------
+    // Guardar cada núcleo como TIFF
+    // -------------------------------------------------------------
+
+    def pathNucleo = new File(
+            outDir,
+            d.getName() + ".tif"
+    ).getAbsolutePath()
+
+
+    IJ.saveAsTiff(
+            imp,
+            pathNucleo
+    )
+}
+
+
+
+// ---------- 8) Mediciones ----------
+
+saveDetectionMeasurements(
+
+        new File(
+                outDir,
+                nombre +
+                "_mediciones.csv"
+        ).getAbsolutePath()
+
+)
+
+
+println ""
+println "=============================================="
+println "LISTO"
+println "=============================================="
+
+println ""
+
+println "Núcleos exportados: ${nucleos.size()}"
+
+println ""
+
+println "Calibración:"
+println "Pixel Width  = ${cal.getPixelWidthMicrons()} µm/px"
+println "Pixel Height = ${cal.getPixelHeightMicrons()} µm/px"
+
+println ""
+
+println "Resultados:"
+println outDir.getAbsolutePath()
+
+println "=============================================="
