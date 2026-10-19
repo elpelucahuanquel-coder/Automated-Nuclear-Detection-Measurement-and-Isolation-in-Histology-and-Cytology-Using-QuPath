@@ -53,6 +53,4 @@ This workflow can support quantitative morphological studies of nuclei in histol
 
 The script is intended as a research tool. Detection parameters and segmentation results should be evaluated for each dataset, and automated measurements should be validated before drawing diagnostic or scientific conclusions.
 
-## License
 
-Add the license appropriate for your project if you intend to distribute or reuse this code publicly.
